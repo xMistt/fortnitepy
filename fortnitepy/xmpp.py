@@ -32,12 +32,12 @@ import datetime
 import uuid
 import itertools
 import unicodedata
-import aiohttp
+import websockets
 
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any, Tuple
+from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any
 
-from .errors import XMPPError, PartyError, HTTPException
+from .errors import XMPPError, PartyError
 from .message import FriendMessage, PartyMessage
 from .party import Party, ReceivedPartyInvitation, PartyJoinConfirmation
 from .presence import Presence
@@ -112,99 +112,75 @@ dispatcher = EventDispatcher()
 
 
 class WebsocketTransport:
-    def __init__(self, loop: asyncio.AbstractEventLoop,
-                 stream: 'WebsocketXMLStream',
-                 logger: logging.Logger) -> None:
-        self.loop = loop
+    def __init__(self, stream):
         self.stream = stream
-        self.logger = logger
-
         self.connection = None
+        self.loop = asyncio.get_event_loop()
+
         self._buffer = b''
+
         self._reader_task = None
         self._close_event = asyncio.Event()
 
-    async def create_connection(self, *args,
-                                **kwargs) -> aiohttp.ClientWebSocketResponse:
-        self.session = aiohttp.ClientSession()
-        self.connection = con = await self.session.ws_connect(
+    async def create_connection(self, *args, **kwargs):
+        self.connection = con = await websockets.connect(
             *args, **kwargs
         )
         self.loop.create_task(self.reader())
         self.stream.connection_made(self)
-        self.logger.debug('Websocket connection established.')
         return con
 
-    async def reader(self) -> None:
-        self.logger.debug('Websocket reader is now running.')
+    async def reader(self):
+        try:
+            async for data in self.connection:
+                self.stream.data_received(data)
+        except websockets.ConnectionClosedError:
+            pass
 
-        while True:
-            msg = await self.connection.receive()
+    async def send(self, data):
+        await self.connection.send(data)
 
-            if msg.type == aiohttp.WSMsgType.text:
-                self.stream.data_received(msg.data)
-            if msg.type == aiohttp.WSMsgType.closed:
-                break
-            if msg.type == aiohttp.WSMsgType.error:
-                break
-
-    async def send(self, data: bytes) -> None:
-        await self.connection.send_bytes(data)
-
-    def write(self, data: bytes) -> None:
+    def write(self, data):
         self._buffer += data
 
-    def flush(self) -> None:
+    def flush(self):
         if self._buffer:
-            asyncio.ensure_future(self.send(self._buffer), loop=self.loop)
+            self.loop.create_task(self.send(self._buffer))
 
         self._buffer = b''
 
-    def can_write_eof(self) -> bool:
+    def can_write_eof(self):
         return False
 
-    def write_eof(self) -> None:
+    def write_eof(self):
         raise NotImplementedError("Cannot write_eof() on ws transport")
 
-    def _stop_reader(self) -> None:
+    def _stop_reader(self):
         if self._reader_task is not None and not self._reader_task.cancelled():
             self._reader_task.cancel()
 
-    def close_callback(self, *args) -> None:
-        self._close_event.set()
-
-    def on_close(self, *args) -> None:
-        # We do this to make sure connection_lost() doesnt re-call
-        # _writer.abort().
-        self.stream._writer = None
-
-        self.stream.connection_lost(None)
-
-        try:
-            task = self.loop.create_task(self.session.close())
-        except AttributeError:
-            pass
-        else:
-            task.add_done_callback(self.close_callback)
-
-    def close(self) -> None:
+    def close(self):
         if not self.connection:
             raise RuntimeError('Cannot close a non-existing connection.')
 
         task = self.loop.create_task(self.connection.close())
-        task.add_done_callback(self.on_close)
+        task.add_done_callback(lambda *args: self._close_event.set())
 
         self._stop_reader()
 
-    async def wait_closed(self) -> None:
+    def abort(self):
+        self.connection.transport.abort()
+        self._stop_reader()
+
+    async def wait_closed(self):
         await self._close_event
 
-    def get_extra_info(self, *args, **kwargs) -> Any:
-        return self.connection.get_extra_info(*args, **kwargs)
+    def get_extra_info(self, *args, **kwargs):
+        return self.connection.transport.get_extra_info(*args, **kwargs)
 
 
 class WebsocketXMLStreamWriter(aioxmpp.xml.XMLStreamWriter):
-    def close(self) -> None:
+    def close(self):
         if self._closed:
             return
         self._closed = True
@@ -220,7 +196,7 @@ class WebsocketXMLStreamWriter(aioxmpp.xml.XMLStreamWriter):
 
 
 class WebsocketXMLStream(aioxmpp.protocol.XMLStream):
-    def _reset_state(self) -> None:
+    def _reset_state(self):
         self._kill_state()
 
         self._processor = aioxmpp.xml.XMPPXMLProcessor()
@@ -247,23 +223,15 @@ class WebsocketXMLStream(aioxmpp.protocol.XMLStream):
 
 class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
     @property
-    def tls_supported(self) -> bool:
+    def tls_supported(self):
         return False
 
     @property
-    def dane_supported(self) -> bool:
+    def dane_supported(self):
         return False
 
-    async def connect(self, loop: asyncio.AbstractEventLoop,
-                      metadata: aioxmpp.security_layer.SecurityLayer,
-                      domain: str,
-                      host: str,
-                      port: int,
-                      negotiation_timeout: Union[int, float],
-                      base_logger: Optional[logging.Logger] = None
-                      ) -> Tuple[WebsocketTransport,
-                                 WebsocketXMLStream,
-                                 aioxmpp.nonza.StreamFeatures]:
+    async def connect(self, loop, metadata, domain, host, port,
+                      negotiation_timeout, base_logger=None):
         features_future = asyncio.Future(loop=loop)
 
         stream = WebsocketXMLStream(
@@ -272,22 +240,10 @@ class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
             base_logger=base_logger,
         )
 
-        if base_logger is not None:
-            logger = base_logger.getChild(type(self).__name__)
-        else:
-            logger = logging.getLogger(".".join([
-                __name__, type(self).__qualname__,
-            ]))
-
-        transport = WebsocketTransport(
-            loop,
-            stream,
-            logger,
-        )
+        transport = WebsocketTransport(stream)
         await transport.create_connection(
-            'wss://{host}'.format(host=host),
-            protocols=('xmpp',),
-            timeout=10,
+            'wss://{0}'.format(host),
+            subprotocols=('xmpp',),
         )
 
         return transport, stream, await features_future
@@ -412,16 +368,12 @@ class XMPPClient:
             else:
                 data = data.get_raw()
 
-            data = {
+            pf = self.client.store_pending_friend({
                 **data,
                 'direction': _payload['direction'],
                 'status': _status,
                 'created': body['timestamp']
-            }
-            if _payload['direction'] == 'INBOUND':
-                pf = self.client.store_incoming_pending_friend(data)
-            else:
-                pf = self.client.store_outgoing_pending_friend(data)
+            })
 
             self.client.dispatch_event('friend_request', pf)
 
@@ -482,12 +434,6 @@ class XMPPClient:
             data = (await self.client.http.party_lookup_ping(pinger))[0]
         except IndexError:
             return
-        except HTTPException as exc:
-            m = 'errors.com.epicgames.social.party.ping_not_found'
-            if exc.message_code == m:
-                return
-
-            raise
 
         for inv in data['invites']:
             if inv['sent_by'] == pinger and inv['status'] == 'SENT':
@@ -968,15 +914,13 @@ class XMPPClient:
             except (KeyError, AttributeError):
                 pass
 
-        before_pres = friend.last_presence
-
         if not is_available and friend.is_online():
             friend._update_last_logout(datetime.datetime.utcnow())
             self.client._presences.remove(user_id, None)
         else:
             self.client._presences.set(user_id, _pres)
 
-        self.client.dispatch_event('friend_presence', before_pres, _pres)
+        self.client.dispatch_event('friend_presence', _pres)
 
     def setup_callbacks(self,
                         messages: bool = True,
@@ -1242,11 +1186,10 @@ class XMPPClient:
 
     async def get_presence(self, jid: aioxmpp.JID) -> Presence:
         self.client.loop.create_task(self.send_presence_probe(jid))
-        _, after = await self.client.wait_for(
+        return await self.client.wait_for(
             'friend_presence',
-            check=lambda b, a: a.friend.id == jid.localpart
+            check=lambda p: p.friend.id == jid.localpart
         )
-        return after
 
     async def send_presence_probe(self, to: aioxmpp.JID) -> None:
         presence = aioxmpp.Presence(
