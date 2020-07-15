@@ -241,6 +241,9 @@ class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
         )
 
         transport = WebsocketTransport(stream)
+        
+        print('Creating websocket transport connection.')
+        
         await transport.create_connection(
             'wss://{0}'.format(host),
             subprotocols=('xmpp',),
